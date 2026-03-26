@@ -135,6 +135,148 @@ func detectSocialEngineering(lower, original string) string {
 	return ""
 }
 
+// SecurityScoreBreakdown holds per-category threat scores (0-25 each).
+type SecurityScoreBreakdown struct {
+	Injection         int `json:"injection"`
+	SocialEngineering int `json:"social_engineering"`
+	Content           int `json:"content"`
+	Spam              int `json:"spam"`
+}
+
+// SecurityScore holds the total security score and per-category breakdown.
+// Total is 0-100: 100 = clean, lower = more threats detected.
+type SecurityScore struct {
+	Total     int                    `json:"total"`
+	Breakdown SecurityScoreBreakdown `json:"breakdown"`
+}
+
+// spamPhrases are low-effort / generic phrases that indicate spam.
+var spamPhrases = []string{
+	"click here", "click now", "buy now", "limited offer", "limited time offer",
+	"act now", "free money", "you have been selected", "congratulations you won",
+	"make money fast", "earn money online", "work from home", "get rich quick",
+	"100% free", "no cost", "special promotion", "exclusive deal",
+	"winner", "prize", "claim your", "you are a winner",
+}
+
+// contentThreatKeywords are severe content categories that contribute to the content score.
+var contentThreatKeywords = map[string][]string{
+	"drugs":         {"drug", "narcotic", "cocaine", "marijuana", "overdose", "substance abuse"},
+	"violence":      {"kill", "murder", "weapon", "gun", "knife", "attack", "bomb", "explode", "assault", "torture"},
+	"adult_content": {"explicit", "nsfw", "porn", "sexual", "erotic", "nude", "fetish"},
+	"illegal":       {"illegal", "fraud", "counterfeit", "launder", "trafficking", "steal", "theft"},
+}
+
+// contentThreatPatterns are word-boundary patterns for content threat keywords.
+var contentThreatPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`\bmeth\b`),
+	regexp.MustCompile(`\bheroin\b`),
+}
+
+// ComputeSecurityScore computes a 0-100 security score for the given text.
+// 100 = fully clean, 0 = maximum threat. Each of 4 categories contributes 0-25.
+func ComputeSecurityScore(text string) SecurityScore {
+	lower := strings.ToLower(text)
+
+	breakdown := SecurityScoreBreakdown{}
+
+	// --- injection (0-25) ---
+	if detectPromptInjection(lower, text) != "" {
+		breakdown.Injection = 25
+	} else {
+		// Partial: count matched phrases/patterns
+		matchCount := 0
+		for _, phrase := range promptInjectionPhrases {
+			if strings.Contains(lower, phrase) {
+				matchCount++
+			}
+		}
+		for _, re := range promptInjectionPatterns {
+			if re.MatchString(lower) {
+				matchCount++
+			}
+		}
+		if matchCount > 0 {
+			breakdown.Injection = min25(matchCount * 8)
+		}
+	}
+
+	// --- social_engineering (0-25) ---
+	if detectSocialEngineering(lower, text) != "" {
+		breakdown.SocialEngineering = 25
+	} else {
+		matchCount := 0
+		for _, re := range socialEngineeringPatterns {
+			if re.MatchString(lower) {
+				matchCount++
+			}
+		}
+		hasURL := strings.Contains(lower, "http://") || strings.Contains(lower, "https://")
+		if hasURL {
+			for _, trigger := range runScriptTriggers {
+				if strings.Contains(lower, trigger) {
+					matchCount++
+				}
+			}
+		}
+		if matchCount > 0 {
+			breakdown.SocialEngineering = min25(matchCount * 8)
+		}
+	}
+
+	// --- content (0-25) ---
+	contentHits := 0
+	for _, keywords := range contentThreatKeywords {
+		for _, kw := range keywords {
+			if strings.Contains(lower, kw) {
+				contentHits++
+				break // count one hit per category
+			}
+		}
+	}
+	// word-boundary patterns for drug terms
+	for _, re := range contentThreatPatterns {
+		if re.MatchString(lower) {
+			contentHits++
+		}
+	}
+	if contentHits > 0 {
+		breakdown.Content = min25(contentHits * 8)
+	}
+
+	// --- spam (0-25) ---
+	spamHits := 0
+	for _, phrase := range spamPhrases {
+		if strings.Contains(lower, phrase) {
+			spamHits++
+		}
+	}
+	if spamHits > 0 {
+		breakdown.Spam = min25(spamHits * 5)
+	}
+
+	total := 100 - breakdown.Injection - breakdown.SocialEngineering - breakdown.Content - breakdown.Spam
+	if total < 0 {
+		total = 0
+	}
+
+	return SecurityScore{
+		Total:     total,
+		Breakdown: breakdown,
+	}
+}
+
+// min25 clamps v to the range [0, 25].
+func min25(v int) int {
+	if v > 25 {
+		return 25
+	}
+	if v < 0 {
+		return 0
+	}
+	return v
+}
+
 // Rating represents content age rating.
 type Rating string
 
@@ -148,11 +290,12 @@ const (
 
 // Result contains classification output.
 type Result struct {
-	Rating  Rating   `json:"rating"`
-	Safe    bool     `json:"safe"`
-	Flags   []string `json:"flags,omitempty"`
-	Score   int      `json:"score"`
-	Details string   `json:"details,omitempty"`
+	Rating        Rating        `json:"rating"`
+	Safe          bool          `json:"safe"`
+	Flags         []string      `json:"flags,omitempty"`
+	Score         int           `json:"score"`
+	Details       string        `json:"details,omitempty"`
+	SecurityScore SecurityScore `json:"security_score"`
 }
 
 // category word lists - severity levels
@@ -349,6 +492,7 @@ func ClassifyWithPolicy(text string, policy *config.Policy) Result {
 	}
 
 	result.Score = maxSeverity
+	result.SecurityScore = ComputeSecurityScore(text)
 
 	switch {
 	case maxSeverity >= 4:
