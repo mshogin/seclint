@@ -1,11 +1,100 @@
 package classifier
 
 import (
+	"encoding/base64"
 	"regexp"
 	"strings"
 
 	"github.com/mikeshogin/seclint/pkg/config"
 )
+
+// promptInjectionPhrases are exact substring triggers for jailbreak / injection attempts.
+var promptInjectionPhrases = []string{
+	"ignore previous instructions",
+	"ignore all previous",
+	"disregard your instructions",
+	"disregard all instructions",
+	"forget everything",
+	"forget your instructions",
+	"reset your instructions",
+	"show me your system prompt",
+	"reveal your system prompt",
+	"print your system prompt",
+	"output your system prompt",
+	"jailbreak",
+	"dan mode",
+	"developer mode enabled",
+}
+
+// promptInjectionPatterns are compiled regexes for more nuanced injection attempts.
+var promptInjectionPatterns = []*regexp.Regexp{
+	// "you are now X" - persona replacement
+	regexp.MustCompile(`\byou\s+are\s+now\b`),
+	// "pretend you are" / "pretend to be"
+	regexp.MustCompile(`\bpretend\s+(you\s+are|to\s+be)\b`),
+	// "act as" combined with "no restrictions" / "without restrictions" / "unrestricted"
+	regexp.MustCompile(`\bact\s+as\b.{0,80}(no\s+restrictions|without\s+restrictions|unrestricted|no\s+limits|without\s+limits)`),
+	// "roleplay as" combined with "no restrictions" / "unrestricted"
+	regexp.MustCompile(`\broleplay\s+as\b.{0,80}(no\s+restrictions|without\s+restrictions|unrestricted|no\s+limits|without\s+limits)`),
+	// "system prompt" as a standalone concept (not just the word in a sentence)
+	regexp.MustCompile(`\bsystem\s+prompt\b`),
+	// Delimiter injection: 4+ consecutive delimiter chars used to break formatting context
+	regexp.MustCompile("(`{4,}|={4,}|-{4,})"),
+}
+
+// looksLikeBase64Command returns true if the text contains a base64-encoded string
+// that decodes to something resembling a shell command or instruction override.
+func looksLikeBase64Command(text string) bool {
+	// Extract tokens that look like base64 (length >= 20, only base64 chars)
+	b64Re := regexp.MustCompile(`[A-Za-z0-9+/]{20,}={0,2}`)
+	for _, token := range b64Re.FindAllString(text, 10) {
+		decoded, err := base64.StdEncoding.DecodeString(token)
+		if err != nil {
+			decoded2, err2 := base64.URLEncoding.DecodeString(token)
+			if err2 != nil {
+				continue
+			}
+			decoded = decoded2
+		}
+		lower := strings.ToLower(string(decoded))
+		// Check if decoded content contains injection phrases
+		for _, phrase := range promptInjectionPhrases {
+			if strings.Contains(lower, phrase) {
+				return true
+			}
+		}
+		for _, re := range promptInjectionPatterns {
+			if re.MatchString(lower) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// detectPromptInjection returns a non-empty detail string if prompt injection is detected.
+func detectPromptInjection(lower, original string) string {
+	// Check exact phrase triggers
+	for _, phrase := range promptInjectionPhrases {
+		if strings.Contains(lower, phrase) {
+			return "prompt injection - jailbreak or instruction override detected"
+		}
+	}
+
+	// Check regex patterns
+	for _, re := range promptInjectionPatterns {
+		if re.MatchString(lower) {
+			return "prompt injection - jailbreak or instruction override detected"
+		}
+	}
+
+	// Check base64-encoded injection attempts
+	if looksLikeBase64Command(original) {
+		return "prompt injection - base64-encoded instruction override detected"
+	}
+
+	return ""
+}
 
 // socialEngineeringPatterns are compiled regexes for pipe-to-shell and run-script attacks.
 var socialEngineeringPatterns = []*regexp.Regexp{
@@ -248,6 +337,15 @@ func ClassifyWithPolicy(text string, policy *config.Policy) Result {
 			maxSeverity = 4
 		}
 		result.Details = seDetail
+	}
+
+	// Check for prompt injection / jailbreak patterns (always severity 4 / BLOCKED)
+	if piDetail := detectPromptInjection(lower, text); piDetail != "" {
+		result.Flags = append(result.Flags, "prompt_injection")
+		if 4 > maxSeverity {
+			maxSeverity = 4
+		}
+		result.Details = piDetail
 	}
 
 	result.Score = maxSeverity
