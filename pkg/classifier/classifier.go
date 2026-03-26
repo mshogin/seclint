@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/mikeshogin/seclint/pkg/audit"
 	"github.com/mikeshogin/seclint/pkg/config"
@@ -176,6 +177,174 @@ func detectSocialEngineering(lower, original string) string {
 	return ""
 }
 
+// l33tMap maps common leet-speak digit/symbol substitutions back to letters.
+var l33tMap = map[rune]rune{
+	'0': 'o',
+	'1': 'l',
+	'3': 'e',
+	'4': 'a',
+	'5': 's',
+	'7': 't',
+	'@': 'a',
+	'$': 's',
+}
+
+// cyrillicHomoglyphs maps Cyrillic code-points that look identical to Latin letters.
+var cyrillicHomoglyphs = map[rune]rune{
+	'\u0430': 'a', // Cyrillic а -> Latin a
+	'\u0435': 'e', // Cyrillic е -> Latin e
+	'\u043e': 'o', // Cyrillic о -> Latin o
+	'\u0441': 'c', // Cyrillic с -> Latin c
+	'\u0440': 'p', // Cyrillic р -> Latin p
+	'\u0445': 'x', // Cyrillic х -> Latin x
+	'\u0443': 'y', // Cyrillic у -> Latin y
+	'\u0410': 'A', // Cyrillic А -> Latin A
+	'\u0415': 'E', // Cyrillic Е -> Latin E
+	'\u041e': 'O', // Cyrillic О -> Latin O
+	'\u0421': 'C', // Cyrillic С -> Latin C
+	'\u0420': 'P', // Cyrillic Р -> Latin P
+	'\u0425': 'X', // Cyrillic Х -> Latin X
+	'\u0423': 'Y', // Cyrillic У -> Latin Y
+	'\u0412': 'B', // Cyrillic В -> Latin B
+	'\u041c': 'M', // Cyrillic М -> Latin M
+	'\u0422': 'T', // Cyrillic Т -> Latin T
+	'\u041a': 'K', // Cyrillic К -> Latin K
+	'\u0418': 'I', // Cyrillic И -> Latin I (approximate)
+	'\u0416': 'J', // Cyrillic Ж -> Latin J (approximate)
+}
+
+// zeroWidthChars contains Unicode zero-width / invisible characters used for obfuscation.
+var zeroWidthChars = []rune{
+	'\u200B', // Zero Width Space
+	'\u200C', // Zero Width Non-Joiner
+	'\u200D', // Zero Width Joiner
+	'\uFEFF', // Zero Width No-Break Space (BOM)
+	'\u00AD', // Soft Hyphen
+	'\u2060', // Word Joiner
+}
+
+// separatorObfuscationPattern detects words separated by repeated non-alnum chars
+// e.g. "i.g.n.o.r.e" or "i-g-n-o-r-e" or "i_g_n_o_r_e".
+var separatorObfuscationPattern = regexp.MustCompile(`[a-zA-Z][.\-_][a-zA-Z]([.\-_][a-zA-Z]){2,}`)
+
+// deobfuscate returns a cleaned version of text by:
+// 1. Stripping zero-width characters.
+// 2. Replacing Cyrillic homoglyphs with their Latin equivalents.
+// 3. Replacing l33t-speak digits with letters.
+// 4. Collapsing separator-obfuscated words (e.g. "i.g.n.o.r.e" -> "ignore").
+func deobfuscate(text string) string {
+	var sb strings.Builder
+	sb.Grow(len(text))
+
+	for _, r := range text {
+		// Strip zero-width / invisible chars
+		isZW := false
+		for _, zw := range zeroWidthChars {
+			if r == zw {
+				isZW = true
+				break
+			}
+		}
+		if isZW {
+			continue
+		}
+
+		// Replace Cyrillic homoglyphs
+		if latin, ok := cyrillicHomoglyphs[r]; ok {
+			sb.WriteRune(latin)
+			continue
+		}
+
+		// Replace l33t digits/symbols
+		if latin, ok := l33tMap[r]; ok {
+			sb.WriteRune(latin)
+			continue
+		}
+
+		sb.WriteRune(r)
+	}
+
+	// Remove separators inside separator-obfuscated words
+	result := separatorObfuscationPattern.ReplaceAllStringFunc(sb.String(), func(match string) string {
+		var out strings.Builder
+		for _, ch := range match {
+			if ch != '.' && ch != '-' && ch != '_' {
+				out.WriteRune(ch)
+			}
+		}
+		return out.String()
+	})
+
+	return result
+}
+
+// detectObfuscation checks text for intentional obfuscation techniques used to bypass
+// content filters. Returns (detected bool, description string).
+func detectObfuscation(text string) (bool, string) {
+	// 1. Zero-width characters
+	for _, zw := range zeroWidthChars {
+		if strings.ContainsRune(text, zw) {
+			return true, "obfuscation - zero-width/invisible character detected"
+		}
+	}
+
+	// 2. Cyrillic homoglyphs mixed with Latin characters
+	for _, r := range text {
+		if _, ok := cyrillicHomoglyphs[r]; ok {
+			return true, "obfuscation - Cyrillic homoglyph replacing Latin character detected"
+		}
+	}
+
+	// 3. Mixed scripts within a single word (Latin + Cyrillic)
+	words := strings.Fields(text)
+	for _, word := range words {
+		hasLatin := false
+		hasCyrillic := false
+		for _, r := range word {
+			if unicode.Is(unicode.Latin, r) {
+				hasLatin = true
+			}
+			if unicode.Is(unicode.Cyrillic, r) {
+				hasCyrillic = true
+			}
+		}
+		if hasLatin && hasCyrillic {
+			return true, "obfuscation - mixed Latin/Cyrillic scripts in single word detected"
+		}
+	}
+
+	// 4. Separator-obfuscated words (e.g. "i.g.n.o.r.e", "i-g-n-o-r-e")
+	if separatorObfuscationPattern.MatchString(text) {
+		return true, "obfuscation - separator-separated characters bypassing word detection"
+	}
+
+	// 5. L33t speak: scan whitespace-delimited words for l33t substitutions.
+	//    Words longer than 15 chars are skipped as they likely belong to base64
+	//    or other encoded data rather than natural l33t-speak words.
+	//    If the text has >= 2 l33t substitutions mixed with alpha chars, flag it.
+	totalL33t := 0
+	totalAlpha := 0
+	for _, word := range strings.Fields(text) {
+		// Strip leading/trailing punctuation
+		word = strings.Trim(word, ".,!?;:\"'()[]{}") //nolint:gocritic
+		if len([]rune(word)) > 15 {
+			continue // skip long tokens (base64, URLs, etc.)
+		}
+		for _, ch := range word {
+			if _, ok := l33tMap[ch]; ok {
+				totalL33t++
+			} else if unicode.IsLetter(ch) {
+				totalAlpha++
+			}
+		}
+	}
+	if totalL33t >= 2 && totalAlpha >= 1 {
+		return true, "obfuscation - l33t speak substitution detected"
+	}
+
+	return false, ""
+}
+
 // SecurityScoreBreakdown holds per-category threat scores (0-25 each).
 type SecurityScoreBreakdown struct {
 	Injection         int `json:"injection"`
@@ -284,6 +453,10 @@ func ComputeSecurityScore(text string) SecurityScore {
 	if contentHits > 0 {
 		breakdown.Content = min25(contentHits * 8)
 	}
+	// Obfuscation raises the content threat score by 15 (capped at 25).
+	if detected, _ := detectObfuscation(text); detected {
+		breakdown.Content = min25(breakdown.Content + 15)
+	}
 
 	// --- spam (0-25) ---
 	spamHits := 0
@@ -305,6 +478,16 @@ func ComputeSecurityScore(text string) SecurityScore {
 		Total:     total,
 		Breakdown: breakdown,
 	}
+}
+
+// containsFlag returns true if flags contains the given flag string.
+func containsFlag(flags []string, flag string) bool {
+	for _, f := range flags {
+		if f == flag {
+			return true
+		}
+	}
+	return false
 }
 
 // min25 clamps v to the range [0, 25].
@@ -417,12 +600,19 @@ func ClassifyWithPolicy(text string, policy *config.Policy) Result {
 		policy = config.DefaultPolicy()
 	}
 
+	// Check for obfuscation up-front so it can be included even on fast-path returns.
+	obfDetected, obfDetail := detectObfuscation(text)
+
 	// Fast path: check threat feed for previously seen patterns.
 	if known, threatType := defaultFeed.IsKnownThreat(text); known {
+		flags := []string{"known_threat:" + threatType}
+		if obfDetected {
+			flags = append(flags, "obfuscation")
+		}
 		result := Result{
 			Rating:  RatingBlock,
 			Safe:    false,
-			Flags:   []string{"known_threat:" + threatType},
+			Flags:   flags,
 			Score:   4,
 			Details: "known threat pattern detected (threat feed match: " + threatType + ")",
 		}
@@ -544,6 +734,36 @@ func ClassifyWithPolicy(text string, policy *config.Policy) Result {
 			maxSeverity = 4
 		}
 		result.Details = piDetail
+	}
+
+	// Check for obfuscation; if detected, also re-run injection/social_eng on clean text.
+	// obfDetected/obfDetail were computed before the fast-path check above.
+	if obfDetected {
+		result.Flags = append(result.Flags, "obfuscation")
+		if result.Details == "" {
+			result.Details = obfDetail
+		}
+		// Re-run checks on de-obfuscated text to catch hidden threats.
+		clean := deobfuscate(text)
+		cleanLower := strings.ToLower(clean)
+		if piDetail2 := detectPromptInjection(cleanLower, clean); piDetail2 != "" {
+			if !containsFlag(result.Flags, "prompt_injection") {
+				result.Flags = append(result.Flags, "prompt_injection")
+			}
+			if 4 > maxSeverity {
+				maxSeverity = 4
+			}
+			result.Details = piDetail2
+		}
+		if seDetail2 := detectSocialEngineering(cleanLower, clean); seDetail2 != "" {
+			if !containsFlag(result.Flags, "social_engineering") {
+				result.Flags = append(result.Flags, "social_engineering")
+			}
+			if 4 > maxSeverity {
+				maxSeverity = 4
+			}
+			result.Details = seDetail2
+		}
 	}
 
 	result.Score = maxSeverity
