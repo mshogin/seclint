@@ -1,10 +1,50 @@
 package classifier
 
 import (
+	"regexp"
 	"strings"
 
 	"github.com/mikeshogin/seclint/pkg/config"
 )
+
+// socialEngineeringPatterns are compiled regexes for pipe-to-shell and run-script attacks.
+var socialEngineeringPatterns = []*regexp.Regexp{
+	// curl/wget piped to shell interpreters
+	regexp.MustCompile(`curl\s+[^\s|]*\s*\|\s*(bash|sh|python[23]?|perl|ruby|node)`),
+	regexp.MustCompile(`wget\s+[^\s|]*\s*\|\s*(bash|sh|python[23]?|perl|ruby|node)`),
+	// backtick execution with curl/wget
+	regexp.MustCompile("`\\s*(curl|wget)\\s+[^`]+`"),
+	// $(curl ...) or $(wget ...) command substitution
+	regexp.MustCompile(`\$\(\s*(curl|wget)\s+[^)]+\)`),
+}
+
+// runScriptTriggers are phrases that prompt the user to execute something.
+var runScriptTriggers = []string{
+	"run this", "execute this", "try this", "run the script", "execute the script",
+	"just run", "simply run", "paste this", "paste and run",
+}
+
+// detectSocialEngineering returns a non-empty detail string if social engineering is found.
+func detectSocialEngineering(lower, original string) string {
+	// Check pipe-to-shell patterns
+	for _, re := range socialEngineeringPatterns {
+		if re.MatchString(lower) {
+			return "social engineering - pipe to shell detected"
+		}
+	}
+
+	// Check "run this/execute" near a URL (http/https link present + trigger phrase)
+	hasURL := strings.Contains(lower, "http://") || strings.Contains(lower, "https://")
+	if hasURL {
+		for _, trigger := range runScriptTriggers {
+			if strings.Contains(lower, trigger) {
+				return "social engineering - run-script prompt with URL detected"
+			}
+		}
+	}
+
+	return ""
+}
 
 // Rating represents content age rating.
 type Rating string
@@ -175,6 +215,15 @@ func ClassifyWithPolicy(text string, policy *config.Policy) Result {
 				result.Flags = append(result.Flags, "custom_allow:"+rule.Pattern)
 			}
 		}
+	}
+
+	// Check for social engineering patterns (always severity 4 / BLOCKED)
+	if seDetail := detectSocialEngineering(lower, text); seDetail != "" {
+		result.Flags = append(result.Flags, "social_engineering")
+		if 4 > maxSeverity {
+			maxSeverity = 4
+		}
+		result.Details = seDetail
 	}
 
 	result.Score = maxSeverity
